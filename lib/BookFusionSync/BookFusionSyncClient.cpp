@@ -330,24 +330,44 @@ BookFusionSyncClient::Error BookFusionSyncClient::getDownloadUrl(uint32_t bookId
   WiFiClientSecure secureClient;
   secureClient.setInsecure();
   HTTPClient http;
+  // HTTP/1.0: server closes connection after body so ArduinoJson can stream-parse
+  // via secureClient.connected() without buffering the full pre-signed S3 URL in
+  // a String (which can be 2000+ chars and causes heap OOM on fragmented heaps).
+  http.useHTTP10(true);
   http.begin(secureClient, url);
   addAuthHeaders(http);
   http.addHeader("Content-Type", "application/json");
 
   const int httpCode = http.POST("{}");
-  String responseBody = http.getString();
-  http.end();
-
   LOG_DBG("BFS", "getDownloadUrl book=%lu response: %d", static_cast<unsigned long>(bookId), httpCode);
 
-  if (httpCode < 0) return NETWORK_ERROR;
-  if (httpCode == 401) return AUTH_FAILED;
-  if (httpCode == 403 || httpCode == 404) return NOT_FOUND;
-  if (httpCode != 200) return SERVER_ERROR;
+  if (httpCode < 0) {
+    http.end();
+    return NETWORK_ERROR;
+  }
+  if (httpCode == 401) {
+    http.end();
+    return AUTH_FAILED;
+  }
+  if (httpCode == 403 || httpCode == 404) {
+    http.end();
+    return NOT_FOUND;
+  }
+  if (httpCode != 200) {
+    http.end();
+    return SERVER_ERROR;
+  }
+
+  // Filter to keep only the url field — avoids a second heap copy of the long URL.
+  JsonDocument filter;
+  filter["url"] = true;
 
   JsonDocument doc;
-  if (deserializeJson(doc, responseBody) != DeserializationError::Ok) {
-    LOG_ERR("BFS", "getDownloadUrl JSON parse error");
+  const auto parseErr = deserializeJson(doc, secureClient, DeserializationOption::Filter(filter));
+  http.end();
+
+  if (parseErr != DeserializationError::Ok) {
+    LOG_ERR("BFS", "getDownloadUrl JSON parse error: %s", parseErr.c_str());
     return JSON_ERROR;
   }
 
