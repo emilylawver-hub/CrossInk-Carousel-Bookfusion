@@ -12,6 +12,8 @@
 
 A new selectable UI theme called "Flow", inheriting from Lyra and overriding only the home-screen book selector with an iPod-style perspective carousel. The currently selected book renders centered at full size, flanked by partial side covers drawn with a 3D fan perspective transform. Up to seven recent books cycle through the carousel. Visual concept ported from CrossPoint Flow.
 
+**Switchable carousel size.** Settings → Display → Carousel Size lets you pick between the original 5-cover layout and a larger 3-cover layout with bigger center and side covers.
+
 ### BookFusion Sync
 
 **Native BookFusion integration.** This fork adds first-class BookFusion sync support to CrossInk Carousel. Link your BookFusion account from Settings → BookFusion Sync, and your library, reading progress, and book downloads stay in sync automatically.
@@ -22,7 +24,7 @@ A new selectable UI theme called "Flow", inheriting from Lyra and overriding onl
 
 **Download progress.** Monitor book downloads with a live progress bar.
 
-**Download streaming fix.** BookFusion pre-signed S3 download URLs regularly exceed 2,000 characters. Earlier builds buffered the full JSON response into a String before parsing, causing intermittent heap-OOM JSON errors on fragmented memory. Both the library search and download URL endpoints now stream-parse directly from the TLS socket using HTTP/1.0, eliminating the double-copy allocation.
+**Download streaming fix.** BookFusion pre-signed S3 download URLs regularly exceed 2,000 characters, so the library search and download-URL endpoints stream-parse directly from the TLS socket instead of buffering the full JSON response. `WiFiClientSecure::read()` returns `-1` between TLS records even while the connection is still open, which ArduinoJson's stream reader was misreading as end-of-input and used to cause intermittent JSON parse errors — a blocking stream wrapper now waits for real data (or a real close) before handing bytes to the parser, fixing the failures for good.
 
 **OTA updates from this fork.** The "Check for Updates" feature in Settings now checks [this fork's releases page](https://github.com/tardigradegit/CrossInk-Carousel-Bookfusion/releases) so your device will always receive BookFusion-enabled firmware.
 
@@ -31,6 +33,8 @@ A new selectable UI theme called "Flow", inheriting from Lyra and overriding onl
 ### Recent Books Grid
 
 Replaced the plain list of book titles with a 3x3 grid of cover thumbnails, paginated when more than nine books exist. Page indicator dots sit at the bottom. Thumbnails are generated on demand the first time a page is viewed — loading will be much faster on subsequent views. Visual concept ported from CrossPoint Flow.
+
+The Books folder in the File Browser has the same 3x3 cover-grid view, toggled with a long-press on HOME. Covers generate from a lightweight OPF-only parse, so grid thumbnails appear even for books you've never opened yet.
 
 ### Reading Stats Redesign
 
@@ -171,10 +175,10 @@ To revert to official firmware, flash from https://crosspointreader.com/#flash-t
 4. Flash:
    ```bash
    # Linux
-   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.11.1.bin
+   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.4.2.bin
 
    # macOS
-   esptool.py --chip esp32c3 --port /dev/cu.usbmodem2101 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.11.1.bin
+   esptool.py --chip esp32c3 --port /dev/cu.usbmodem2101 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.4.2.bin
    ```
    *(Swap the filename for your chosen variant and version.)*
 
