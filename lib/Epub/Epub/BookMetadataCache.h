@@ -102,6 +102,13 @@ class BookMetadataCache {
   // Post-processing to update mappings and sizes
   bool buildBookBin(const std::string& epubPath, const BookMetadata& metadata);
 
+  // Mark as loaded with only cover metadata — for fast cover-thumb generation
+  // without a full cache build. Spine/TOC counts remain zero.
+  void setLoadedWithCoverHref(const std::string& coverHref) {
+    coreMetadata.coverItemHref = coverHref;
+    loaded = true;
+  }
+
   // Reading phase (read mode)
   bool load();
   SpineEntry getSpineEntry(int index);

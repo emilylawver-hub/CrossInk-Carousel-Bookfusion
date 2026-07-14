@@ -52,6 +52,15 @@ class FileBrowserActivity final : public Activity {
   void toggleHiddenFiles();
   size_t findEntry(const std::string& name) const;
 
+  // Cover grid (Books folder only)
+  bool gridMode = false;
+  size_t gridSelectorIndex = 0;
+  int gridLoadedPage = -1;
+
+  bool isInBooksFolder() const;
+  void renderBooksGrid();
+  void generateGridCovers(int pageStart, const std::vector<std::string>& epubs);
+
  public:
   explicit FileBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string initialPath = "/",
                                Mode mode = Mode::Books)

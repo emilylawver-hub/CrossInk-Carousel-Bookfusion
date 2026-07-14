@@ -18,13 +18,11 @@ A new selectable UI theme called "Flow", inheriting from Lyra and overriding onl
 
 **Library browser in File Transfer.** Once your account is linked, a "Bookfusion" entry appears directly in the File Transfer menu — the same place you go to connect Calibre or join a network. Browse and download books without digging through Settings.
 
-**Library browser with categories.** Browse your BookFusion library directly on the device, organized by category.
+**QR auth support.** Log into your BookFusion account by scanning a QR code — no typing required on the device. The auth screen shows both the verification URL as a scannable QR code and the pairing code to enter on your phone.
 
-**QR auth support.** Log into your BookFusion account by scanning a QR code — no typing required on the device.
+**Download progress.** Monitor book downloads with a live progress bar.
 
-**Download progress & cancellation.** Monitor active book downloads and cancel them if needed.
-
-**Download URL buffer fix.** BookFusion pre-signed S3 download URLs now regularly exceed 1,450 characters. Earlier builds silently truncated these at 1,024 bytes, breaking sync. This fork bumps the internal buffer to 2,048 bytes, fixing the issue permanently.
+**Download streaming fix.** BookFusion pre-signed S3 download URLs regularly exceed 2,000 characters. Earlier builds buffered the full JSON response into a String before parsing, causing intermittent heap-OOM JSON errors on fragmented memory. Both the library search and download URL endpoints now stream-parse directly from the TLS socket using HTTP/1.0, eliminating the double-copy allocation.
 
 **OTA updates from this fork.** The "Check for Updates" feature in Settings now checks [this fork's releases page](https://github.com/tardigradegit/CrossInk-Carousel-Bookfusion/releases) so your device will always receive BookFusion-enabled firmware.
 
@@ -93,7 +91,7 @@ There are 3 build variants due to build size constraints: `tiny`, `xlarge`, and 
 
 ### xlarge
 - Emoji & Misc. Symbols support
-- Font sizes: Medium (14pt), Large (16pt), Extra Large (18pt), Huge (20pt)
+- Font sizes: Medium (14pt), Large (16pt), Extra Large (18pt)
 - *(Teensy, Tiny, and Small removed to fit emoji within build size)*
 
 ### no_emoji
@@ -173,10 +171,10 @@ To revert to official firmware, flash from https://crosspointreader.com/#flash-t
 4. Flash:
    ```bash
    # Linux
-   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.9.5.bin
+   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.11.1.bin
 
    # macOS
-   esptool.py --chip esp32c3 --port /dev/cu.usbmodem2101 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.9.5.bin
+   esptool.py --chip esp32c3 --port /dev/cu.usbmodem2101 --baud 921600 write_flash 0x10000 /path/to/carousel-firmware-tiny-v1.2.11.1.bin
    ```
    *(Swap the filename for your chosen variant and version.)*
 

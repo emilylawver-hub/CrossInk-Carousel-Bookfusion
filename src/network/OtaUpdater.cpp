@@ -6,16 +6,18 @@ const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() { return NO_UPDATE; }
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, std::atomic<bool>*) { return NO_UPDATE; }
 #else
+#include <HalStorage.h>
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
 
 #include <cstring>
+#include <memory>
 
 #include "AppVersion.h"
+#include "FirmwareFlasher.h"
 #include "OtaUpdater.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
-#include "esp_https_ota.h"
 #include "esp_wifi.h"
 
 namespace {
@@ -263,77 +265,109 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   }
 
   processedSize = 0;
+  totalSize = otaSize;
 
-  esp_https_ota_handle_t ota_handle = NULL;
-  esp_err_t esp_err;
+  // esp_https_ota uses esp_image_verify internally which rejects this device's
+  // patched firmware. Download to SD first, then flash via FirmwareFlasher which
+  // skips that check (matching the SD card update path that is known to work).
+  constexpr const char* tempPath = "/.ota_dl.bin";
+
+  FsFile tempFile;
+  if (!Storage.openFileForWrite("OTA", tempPath, tempFile)) {
+    LOG_ERR("OTA", "Failed to open temp download file");
+    return INTERNAL_UPDATE_ERROR;
+  }
 
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
-      .timeout_ms = 15000,
-      /* Default HTTP client buffer size 512 byte only
-       * not sufficient to handle URL redirection cases or
-       * parsing of large HTTP headers.
-       */
-      .buffer_size = 8192,
+      .timeout_ms = 60000,
+      .buffer_size = 16384,
       .buffer_size_tx = 8192,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = esp_crt_bundle_attach,
       .keep_alive_enable = true,
   };
 
-  esp_https_ota_config_t ota_config = {
-      .http_config = &client_config,
-      .http_client_init_cb = http_client_set_header_cb,
-  };
-
-  /* For better timing and connectivity, we disable power saving for WiFi */
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  esp_err = esp_https_ota_begin(&ota_config, &ota_handle);
-  if (esp_err != ESP_OK) {
-    LOG_DBG("OTA", "HTTP OTA Begin Failed: %s", esp_err_to_name(esp_err));
+  esp_http_client_handle_t client = esp_http_client_init(&client_config);
+  if (!client) {
+    LOG_ERR("OTA", "HTTP client init failed");
+    tempFile.close();
+    Storage.remove(tempPath);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     return INTERNAL_UPDATE_ERROR;
   }
 
-  do {
-    if (isCancellationRequested()) {
-      LOG_INF("OTA", "Update cancelled");
-      esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-      esp_https_ota_abort(ota_handle);
-      return CANCELLED_ERROR;
-    }
+  esp_http_client_set_header(client, "User-Agent", "CrossInk-ESP32-" CROSSINK_VERSION);
 
-    esp_err = esp_https_ota_perform(ota_handle);
-    processedSize = esp_https_ota_get_image_len_read(ota_handle);
-    if (onProgress) onProgress(ctx);
-    delay(100);  // TODO: should we replace this with something better?
-  } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
-
-  if (isCancellationRequested()) {
-    LOG_INF("OTA", "Update cancelled");
+  const esp_err_t openErr = esp_http_client_open(client, 0);
+  if (openErr != ESP_OK) {
+    LOG_ERR("OTA", "HTTP open failed: %s", esp_err_to_name(openErr));
+    esp_http_client_cleanup(client);
+    tempFile.close();
+    Storage.remove(tempPath);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    esp_https_ota_abort(ota_handle);
-    return CANCELLED_ERROR;
-  }
-
-  /* Return back to default power saving for WiFi in case of failing */
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_perform Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
     return HTTP_ERROR;
   }
 
-  if (!esp_https_ota_is_complete_data_received(ota_handle)) {
-    LOG_ERR("OTA", "esp_https_ota_is_complete_data_received Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
+  const int contentLength = esp_http_client_fetch_headers(client);
+  if (contentLength > 0) {
+    totalSize = static_cast<size_t>(contentLength);
+  }
+
+  constexpr size_t CHUNK = 4096;
+  auto buf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[CHUNK]);
+  if (!buf) {
+    LOG_ERR("OTA", "OOM");
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    tempFile.close();
+    Storage.remove(tempPath);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     return INTERNAL_UPDATE_ERROR;
   }
 
-  esp_err = esp_https_ota_finish(ota_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_finish Failed: %s", esp_err_to_name(esp_err));
+  bool downloadOk = true;
+  while (!isCancellationRequested()) {
+    const int len = esp_http_client_read(client, reinterpret_cast<char*>(buf.get()), CHUNK);
+    if (len < 0) {
+      LOG_ERR("OTA", "HTTP read error: %d", len);
+      downloadOk = false;
+      break;
+    }
+    if (len == 0) break;
+    if (tempFile.write(buf.get(), static_cast<size_t>(len)) != static_cast<size_t>(len)) {
+      LOG_ERR("OTA", "SD write failed");
+      downloadOk = false;
+      break;
+    }
+    processedSize += static_cast<size_t>(len);
+    if (onProgress) onProgress(ctx);
+  }
+
+  const bool cancelled = isCancellationRequested();
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  tempFile.close();
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+  if (cancelled) {
+    Storage.remove(tempPath);
+    return CANCELLED_ERROR;
+  }
+
+  if (!downloadOk || processedSize == 0) {
+    Storage.remove(tempPath);
+    return HTTP_ERROR;
+  }
+
+  LOG_INF("OTA", "Download complete (%zu bytes), flashing from SD", processedSize);
+  const auto flashResult = firmware_flash::flashFromSdPath(tempPath, nullptr, nullptr, false);
+  Storage.remove(tempPath);
+
+  if (flashResult != firmware_flash::Result::OK) {
+    LOG_ERR("OTA", "Flash failed: %s", firmware_flash::resultName(flashResult));
     return INTERNAL_UPDATE_ERROR;
   }
 

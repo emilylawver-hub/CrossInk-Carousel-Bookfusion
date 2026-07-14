@@ -1,6 +1,7 @@
 #include "FileBrowserActivity.h"
 
 #include <Arduino.h>
+#include <Bitmap.h>
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 
 #include "BookmarkStore.h"
+#include "components/icons/book.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "FileBrowserActionActivity.h"
@@ -25,6 +27,14 @@ namespace {
 constexpr unsigned long GO_HOME_MS = 1000;
 constexpr unsigned long COMPLETED_FEEDBACK_MS = 1000;
 constexpr int ROOT_HINT_GAP = 20;
+
+// Cover grid (Books folder only)
+constexpr int GRID_COLS = 3;
+constexpr int GRID_COVER_WIDTH = 136;
+constexpr int GRID_COVER_HEIGHT = 160;
+constexpr int GRID_SPACING = 14;
+constexpr int GRID_TITLE_GAP = 4;
+constexpr int GRID_BOOKS_PER_PAGE = 9;
 
 bool isSleepFolderPath(const std::string& path) { return path == "/sleep" || path == "/.sleep"; }
 
@@ -128,8 +138,11 @@ void collectMetadataPathsRecursively(const std::string& dirPath, std::vector<std
 std::string getFileName(std::string filename);
 }  // namespace
 
+bool FileBrowserActivity::isInBooksFolder() const { return basepath == "/books"; }
+
 void FileBrowserActivity::loadFiles() {
   files.clear();
+  gridLoadedPage = -1;
 
   auto root = Storage.open(basepath.c_str());
   if (!root || !root.isDirectory()) {
@@ -494,7 +507,14 @@ void FileBrowserActivity::loop() {
   if (mode == Mode::Books && !longPressBackHandled && mappedInput.isPressed(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() >= GO_HOME_MS && !lockLongPressBack) {
     longPressBackHandled = true;
-    toggleHiddenFiles();
+    if (isInBooksFolder()) {
+      gridMode = !gridMode;
+      gridSelectorIndex = 0;
+      gridLoadedPage = -1;
+      requestUpdate(true);
+    } else {
+      toggleHiddenFiles();
+    }
     return;
   }
 
@@ -538,6 +558,19 @@ void FileBrowserActivity::loop() {
       return;
     }
     if (files.empty()) return;
+
+    if (gridMode && isInBooksFolder()) {
+      size_t epubIdx = 0;
+      for (const auto& f : files) {
+        if (!FsHelpers::hasEpubExtension(f)) continue;
+        if (epubIdx == gridSelectorIndex) {
+          onSelectBook(buildFullPath(basepath, f));
+          return;
+        }
+        epubIdx++;
+      }
+      return;
+    }
 
     const std::string& entry = files[selectorIndex];
     bool isDirectory = (entry.back() == '/');
@@ -607,26 +640,51 @@ void FileBrowserActivity::loop() {
     }
   }
 
-  int listSize = static_cast<int>(files.size());
-  buttonNavigator.onNextRelease([this, listSize] {
-    selectorIndex = ButtonNavigator::nextIndex(static_cast<int>(selectorIndex), listSize);
-    requestUpdate();
-  });
-
-  buttonNavigator.onPreviousRelease([this, listSize] {
-    selectorIndex = ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize);
-    requestUpdate();
-  });
-
-  buttonNavigator.onNextContinuous([this, listSize, pageItems] {
-    selectorIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
-    requestUpdate();
-  });
-
-  buttonNavigator.onPreviousContinuous([this, listSize, pageItems] {
-    selectorIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
-    requestUpdate();
-  });
+  if (gridMode && isInBooksFolder()) {
+    size_t epubCount = 0;
+    for (const auto& f : files) {
+      if (FsHelpers::hasEpubExtension(f)) epubCount++;
+    }
+    const int gridSize = static_cast<int>(epubCount);
+    buttonNavigator.onNextRelease([this, gridSize] {
+      gridSelectorIndex = static_cast<size_t>(
+          ButtonNavigator::nextIndex(static_cast<int>(gridSelectorIndex), gridSize));
+      requestUpdate();
+    });
+    buttonNavigator.onPreviousRelease([this, gridSize] {
+      gridSelectorIndex = static_cast<size_t>(
+          ButtonNavigator::previousIndex(static_cast<int>(gridSelectorIndex), gridSize));
+      requestUpdate();
+    });
+    buttonNavigator.onNextContinuous([this, gridSize] {
+      gridSelectorIndex = static_cast<size_t>(
+          ButtonNavigator::nextPageIndex(static_cast<int>(gridSelectorIndex), gridSize, GRID_BOOKS_PER_PAGE));
+      requestUpdate();
+    });
+    buttonNavigator.onPreviousContinuous([this, gridSize] {
+      gridSelectorIndex = static_cast<size_t>(
+          ButtonNavigator::previousPageIndex(static_cast<int>(gridSelectorIndex), gridSize, GRID_BOOKS_PER_PAGE));
+      requestUpdate();
+    });
+  } else {
+    int listSize = static_cast<int>(files.size());
+    buttonNavigator.onNextRelease([this, listSize] {
+      selectorIndex = ButtonNavigator::nextIndex(static_cast<int>(selectorIndex), listSize);
+      requestUpdate();
+    });
+    buttonNavigator.onPreviousRelease([this, listSize] {
+      selectorIndex = ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize);
+      requestUpdate();
+    });
+    buttonNavigator.onNextContinuous([this, listSize, pageItems] {
+      selectorIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+      requestUpdate();
+    });
+    buttonNavigator.onPreviousContinuous([this, listSize, pageItems] {
+      selectorIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+      requestUpdate();
+    });
+  }
 }
 
 namespace {
@@ -654,6 +712,11 @@ std::string getFileExtension(std::string filename) {
 }  // namespace
 
 void FileBrowserActivity::render(RenderLock&&) {
+  if (gridMode && isInBooksFolder()) {
+    renderBooksGrid();
+    return;
+  }
+
   renderer.clearScreen();
 
   const auto pageWidth = renderer.getScreenWidth();
@@ -737,6 +800,12 @@ void FileBrowserActivity::render(RenderLock&&) {
     const auto hint = renderer.truncatedText(SMALL_FONT_ID, tr(STR_TOGGLE_HIDDEN_FILES_HINT), hintMaxWidth);
     const int hintWidth = renderer.getTextWidth(SMALL_FONT_ID, hint.c_str());
     renderer.drawText(SMALL_FONT_ID, pageWidth - metrics.contentSidePadding - hintWidth, pathY, hint.c_str());
+  } else if (mode == Mode::Books && isInBooksFolder()) {
+    const int usedPathWidth = renderer.getTextWidth(SMALL_FONT_ID, basepath.c_str());
+    const int hintMaxWidth = pathMaxWidth - usedPathWidth - ROOT_HINT_GAP;
+    const auto hint = renderer.truncatedText(SMALL_FONT_ID, tr(STR_TOGGLE_COVER_GRID_HINT), hintMaxWidth);
+    const int hintWidth = renderer.getTextWidth(SMALL_FONT_ID, hint.c_str());
+    renderer.drawText(SMALL_FONT_ID, pageWidth - metrics.contentSidePadding - hintWidth, pathY, hint.c_str());
   }
 
   if (pendingCompletedFeedback) {
@@ -750,4 +819,155 @@ size_t FileBrowserActivity::findEntry(const std::string& name) const {
   for (size_t i = 0; i < files.size(); i++)
     if (files[i] == name) return i;
   return 0;
+}
+
+void FileBrowserActivity::generateGridCovers(int pageStart, const std::vector<std::string>& epubs) {
+  const int pageEnd = std::min(pageStart + GRID_BOOKS_PER_PAGE, static_cast<int>(epubs.size()));
+
+  bool needsGeneration = false;
+  for (int i = pageStart; i < pageEnd; ++i) {
+    Epub epub(buildFullPath(basepath, epubs[i]), "/.crosspoint");
+    const std::string thumbPath = epub.getThumbBmpPath(GRID_COVER_WIDTH, GRID_COVER_HEIGHT);
+    if (thumbPath.empty() || !Storage.exists(thumbPath.c_str())) {
+      needsGeneration = true;
+      break;
+    }
+  }
+  if (!needsGeneration) {
+    gridLoadedPage = pageStart;
+    return;
+  }
+
+  const Rect popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  const int total = pageEnd - pageStart;
+  int done = 0;
+
+  for (int i = pageStart; i < pageEnd; ++i) {
+    const std::string fullPath = buildFullPath(basepath, epubs[i]);
+    Epub epub(fullPath, "/.crosspoint");
+    const std::string thumbPath = epub.getThumbBmpPath(GRID_COVER_WIDTH, GRID_COVER_HEIGHT);
+    if (!thumbPath.empty() && Storage.exists(thumbPath.c_str())) {
+      done++;
+      continue;
+    }
+    GUI.fillPopupProgress(renderer, popupRect, 10 + done * (90 / total));
+    epub.generateThumbBmpFast(GRID_COVER_WIDTH, GRID_COVER_HEIGHT);
+    done++;
+  }
+
+  gridLoadedPage = pageStart;
+  requestUpdate();
+}
+
+void FileBrowserActivity::renderBooksGrid() {
+  renderer.clearScreen();
+
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const auto& metrics = UITheme::getInstance().getMetrics();
+
+  const std::string folderName = basepath.substr(basepath.rfind('/') + 1);
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderName.c_str());
+
+  // Collect epub files only
+  std::vector<std::string> epubs;
+  for (const auto& f : files) {
+    if (FsHelpers::hasEpubExtension(f)) epubs.push_back(f);
+  }
+
+  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+  const int titleLineH = renderer.getLineHeight(SMALL_FONT_ID);
+  const int cellH = GRID_COVER_HEIGHT + GRID_TITLE_GAP + titleLineH;
+  const int totalGridWidth = GRID_COLS * GRID_COVER_WIDTH + (GRID_COLS - 1) * GRID_SPACING;
+  const int startX = (pageWidth - totalGridWidth) / 2;
+
+  if (epubs.empty()) {
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, tr(STR_NO_FILES_FOUND));
+  } else {
+    const int totalEpubs = static_cast<int>(epubs.size());
+    const int totalPages = (totalEpubs + GRID_BOOKS_PER_PAGE - 1) / GRID_BOOKS_PER_PAGE;
+    const int currentPage = static_cast<int>(gridSelectorIndex) / GRID_BOOKS_PER_PAGE;
+    const int pageStart = currentPage * GRID_BOOKS_PER_PAGE;
+    const int pageCount = std::min(GRID_BOOKS_PER_PAGE, totalEpubs - pageStart);
+
+    for (int i = 0; i < pageCount; ++i) {
+      const int epubIdx = pageStart + i;
+      const int col = i % GRID_COLS;
+      const int row = i / GRID_COLS;
+      const int x = startX + col * (GRID_COVER_WIDTH + GRID_SPACING);
+      const int y = contentTop + row * (cellH + GRID_SPACING);
+
+      const std::string fullPath = buildFullPath(basepath, epubs[epubIdx]);
+      Epub epub(fullPath, "/.crosspoint");
+      const std::string thumbPath = epub.getThumbBmpPath(GRID_COVER_WIDTH, GRID_COVER_HEIGHT);
+
+      int bx = x, by = y, bw = GRID_COVER_WIDTH, bh = GRID_COVER_HEIGHT;
+      bool drawn = false;
+
+      if (!thumbPath.empty() && Storage.exists(thumbPath.c_str())) {
+        FsFile file;
+        if (Storage.openFileForRead("FBGrid", thumbPath, file)) {
+          Bitmap bmp(file);
+          if (bmp.parseHeaders() == BmpReaderError::Ok && bmp.getWidth() > 0 && bmp.getHeight() > 0) {
+            bw = std::min(GRID_COVER_WIDTH, bmp.getWidth());
+            bh = std::min(GRID_COVER_HEIGHT, bmp.getHeight());
+            bx = x + (GRID_COVER_WIDTH - bw) / 2;
+            by = y + (GRID_COVER_HEIGHT - bh) / 2;
+            renderer.drawBitmap(bmp, bx, by, bw, bh);
+            renderer.drawRect(bx, by, bw, bh, 2, true);
+            drawn = true;
+          }
+          file.close();
+        }
+      }
+      if (!drawn) {
+        renderer.drawRect(bx, by, bw, bh, 2, true);
+        renderer.fillRect(bx + 2, by + 2, bw - 4, bh - 4, false);
+        renderer.drawIcon(BookIcon, bx + (bw - 32) / 2, by + (bh - 32) / 2, 32, 32);
+      }
+      if (epubIdx == static_cast<int>(gridSelectorIndex)) {
+        renderer.drawRect(bx - 2, by - 2, bw + 4, bh + 4, 3, true);
+      }
+
+      // Title centred below cover
+      const int titleX = x;
+      const int titleY = y + GRID_COVER_HEIGHT + GRID_TITLE_GAP;
+      const std::string title = getFileName(epubs[epubIdx]);
+      const std::string truncTitle = renderer.truncatedText(SMALL_FONT_ID, title.c_str(), GRID_COVER_WIDTH);
+      const int textW = renderer.getTextWidth(SMALL_FONT_ID, truncTitle.c_str());
+      renderer.drawText(SMALL_FONT_ID, titleX + (GRID_COVER_WIDTH - textW) / 2, titleY, truncTitle.c_str());
+    }
+
+    if (totalPages > 1) {
+      constexpr int dotSize = 10;
+      constexpr int dotSpacing = 8;
+      const int totalDotWidth = totalPages * dotSize + (totalPages - 1) * dotSpacing;
+      const int dotsStartX = (pageWidth - totalDotWidth) / 2;
+      const int dotY = pageHeight - metrics.buttonHintsHeight - metrics.verticalSpacing - 4;
+      for (int p = 0; p < totalPages; p++) {
+        const int dx = dotsStartX + p * (dotSize + dotSpacing);
+        if (p == currentPage) {
+          renderer.fillRoundedRect(dx, dotY, dotSize, dotSize, dotSize / 2, Color::Black);
+        } else {
+          renderer.drawRoundedRect(dx, dotY, dotSize, dotSize, 1, dotSize / 2, true);
+        }
+      }
+    }
+  }
+
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), epubs.empty() ? "" : tr(STR_OPEN),
+                                            tr(STR_DIR_PREV), tr(STR_DIR_NEXT));
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+  renderer.displayBuffer();
+
+  // Generate missing covers after first paint so the user sees placeholder
+  // slots immediately, then the loading popup appears as covers are generated.
+  if (!epubs.empty()) {
+    const int currentPage = static_cast<int>(gridSelectorIndex) / GRID_BOOKS_PER_PAGE;
+    const int pageStart = currentPage * GRID_BOOKS_PER_PAGE;
+    if (gridLoadedPage != pageStart) {
+      generateGridCovers(pageStart, epubs);
+    }
+  }
 }

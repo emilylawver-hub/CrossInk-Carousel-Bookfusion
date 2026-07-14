@@ -112,6 +112,8 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         SettingInfo::Enum(StrId::STR_SLEEP_COVER_FILTER, &CrossPointSettings::sleepScreenCoverFilter,
                           {StrId::STR_NONE_OPT, StrId::STR_FILTER_CONTRAST, StrId::STR_INVERTED},
                           "sleepScreenCoverFilter", StrId::STR_CAT_DISPLAY),
+        SettingInfo::Enum(StrId::STR_QUICK_RESUME, &CrossPointSettings::quickResumeOnTimeout,
+                          {StrId::STR_OFF, StrId::STR_ON}, "quickResumeOnTimeout", StrId::STR_CAT_DISPLAY),
         SettingInfo::Enum(StrId::STR_HIDE_BATTERY, &CrossPointSettings::hideBatteryPercentage,
                           {StrId::STR_NEVER, StrId::STR_IN_READER, StrId::STR_ALWAYS}, "hideBatteryPercentage",
                           StrId::STR_CAT_DISPLAY),
@@ -128,6 +130,11 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
 #endif
                           },
                           "uiTheme", StrId::STR_CAT_DISPLAY),
+        // Flow carousel layout — directly under the theme picker so it reads
+        // as a sub-option of theme selection. Always visible (other themes
+        // just ignore the value).
+        SettingInfo::Enum(StrId::STR_CAROUSEL_SIZE, &CrossPointSettings::flowCarouselSize,
+                          {StrId::STR_FIVE, StrId::STR_THREE}, "flowCarouselSize", StrId::STR_CAT_DISPLAY),
         SettingInfo::Enum(StrId::STR_RECENT_BOOKS_VIEW, &CrossPointSettings::recentBooksView,
                           {StrId::STR_LIST_VIEW, StrId::STR_GRID_VIEW}, "recentBooksView", StrId::STR_CAT_DISPLAY),
         SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",

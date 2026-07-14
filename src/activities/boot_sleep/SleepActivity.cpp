@@ -343,6 +343,17 @@ bool selectRandomSleepImage(SleepImageMode mode, SleepImageSelection& selection)
 void SleepActivity::onEnter() {
   Activity::onEnter();
 
+  // Quick Resume on auto-sleep: when we're auto-sleeping (timeout fired) from
+  // inside a book and the user has enabled the setting, take the dedicated
+  // path that leaves the reader page on the panel and lets main.cpp dump the
+  // framebuffer for next-boot restoration. Manual power-button sleeps fall
+  // through to the normal sleep screens regardless of this setting so the
+  // user can still glance the cover / wallpaper they configured.
+  if (fromTimeout && APP_STATE.lastSleepFromReader && SETTINGS.quickResumeOnTimeout != 0) {
+    renderQuickResumeSleepScreen();
+    return;
+  }
+
   overlayPageBufferStored = SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY &&
                             APP_STATE.lastSleepFromReader && renderer.storeBwBuffer();
   overlayPageBufferTrusted = overlayPageBufferStored && canSnapshotOverlayBackground;
@@ -598,6 +609,52 @@ void SleepActivity::renderReadingStatsSleepScreen() const {
   }
 
   renderBookStatsView(renderer, nullptr, bookTitle, bookStats, globalStats, false);
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+}
+
+void SleepActivity::renderQuickResumeSleepScreen() const {
+  // Leave the framebuffer's existing reader-page content COMPLETELY intact —
+  // text, status bar, battery, progress bar, chapter title, percent. The
+  // user wants to see exactly the page they were on, including all chrome.
+  // We deliberately don't call hideOverlayBatteryStrip() here (which the
+  // OVERLAY sleep mode uses to wipe the stale battery glance) — Quick Resume
+  // is meant to look like the device just paused, not transitioned.
+  if (APP_STATE.lastSleepFromReader) {
+    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+  }
+
+  // Crescent moon hint in the bottom-right corner. Bottom-right is safe
+  // regardless of whether the reader's status bar / chrome is visible —
+  // status-bar text and progress bar don't reach that corner under any
+  // status-bar setting. (Earlier the hint sat next to the percent text,
+  // but if the user has the status bar minimised or off, the hint would
+  // appear floating without context.)
+  //
+  // Crescent is drawn as two filled rounded rects: an outer black disc and
+  // an inner white cutout offset to the upper-right. Resembles the moon
+  // emoji and reads as "sleep" at a small size.
+  const int screenWidth = renderer.getScreenWidth();
+  const int screenHeight = renderer.getScreenHeight();
+  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                   &orientedMarginLeft);
+  constexpr int kMoonSize = 16;
+  constexpr int kMoonInset = 14;
+  const int moonX = screenWidth - orientedMarginRight - kMoonInset - kMoonSize;
+  const int moonY = screenHeight - orientedMarginBottom - kMoonInset - kMoonSize;
+
+  // Outer dark disc.
+  renderer.fillRoundedRect(moonX, moonY, kMoonSize, kMoonSize, kMoonSize / 2, true, true, true, true, Color::Black);
+  // Inner white cutout — offset right and slightly smaller → left-facing crescent
+  // with the gap on the upper-right. The cutout intentionally pokes slightly
+  // outside the disc on the right; those overflow pixels just paint white over
+  // whatever was there (almost always white background already).
+  constexpr int kCutoutSize = 14;
+  constexpr int kCutoutOffsetX = 5;
+  constexpr int kCutoutOffsetY = -1;
+  renderer.fillRoundedRect(moonX + kCutoutOffsetX, moonY + kCutoutOffsetY, kCutoutSize, kCutoutSize, kCutoutSize / 2,
+                           true, true, true, true, Color::White);
+
   renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 }
 

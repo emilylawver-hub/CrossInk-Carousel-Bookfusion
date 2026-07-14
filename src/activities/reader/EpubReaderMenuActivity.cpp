@@ -89,12 +89,16 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
   constexpr size_t baseItemCount = 14;
   const size_t totalItemCount = baseItemCount + (hasFootnotes ? 1u : 0u) + (hasBookmarks ? 2u : 0u);
   items.reserve(totalItemCount);
-  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
-  items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});
-  items.push_back({MenuAction::CONTROLS_OPTIONS, StrId::STR_CAT_CONTROLS});
+  // v1.3.0 polish: Footnotes goes above Select Chapter when present. Books
+  // that use footnote markup tend to be non-fiction where the user dips
+  // into notes far more often than they jump chapters, so this ordering
+  // matches the common task.
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
+  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
+  items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});
+  items.push_back({MenuAction::CONTROLS_OPTIONS, StrId::STR_CAT_CONTROLS});
   items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
   items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_INTERVAL_SECONDS});
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
@@ -109,7 +113,6 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
   items.push_back({MenuAction::GO_HOME, StrId::STR_GO_HOME_BUTTON});
   items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
   items.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-  items.push_back({MenuAction::STORYTELLER_SYNC, StrId::STR_ST_SYNC_PROGRESS});
   items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   items.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
@@ -198,13 +201,24 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
   const int hintGutterHeight = isPortraitInverted ? 50 : 0;
   const int contentY = hintGutterHeight;
 
-  // Title
-  const std::string truncTitle =
-      renderer.truncatedText(UI_12_FONT_ID, title.c_str(), contentWidth - 40, EpdFontFamily::BOLD);
-  // Manual centering so we can respect the content gutter.
-  const int titleX =
-      contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, truncTitle.c_str(), EpdFontFamily::BOLD)) / 2;
-  renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, truncTitle.c_str(), true, EpdFontFamily::BOLD);
+  // Title — wraps up to 2 lines for long book titles (v1.3.0 UX polish).
+  // Short titles still fit on a single line and the layout is unchanged;
+  // long titles wrap and we shift the rest of the menu down by one extra
+  // line height so the title remains fully visible instead of getting an
+  // ellipsis at the end.
+  const auto titleLines = renderer.wrappedText(UI_12_FONT_ID, title.c_str(), contentWidth - 40, 2, EpdFontFamily::BOLD);
+  const int titleLineH = renderer.getLineHeight(UI_12_FONT_ID);
+  int titleY = 15 + contentY;
+  for (const auto& line : titleLines) {
+    const int lineW = renderer.getTextWidth(UI_12_FONT_ID, line.c_str(), EpdFontFamily::BOLD);
+    const int lineX = contentX + (contentWidth - lineW) / 2;
+    renderer.drawText(UI_12_FONT_ID, lineX, titleY, line.c_str(), true, EpdFontFamily::BOLD);
+    titleY += titleLineH;
+  }
+  // Extra vertical offset applied to progress + menu start when the title
+  // actually wrapped. Zero for the common single-line case so existing
+  // layouts are byte-identical.
+  const int wrapOffset = (titleLines.size() > 1) ? titleLineH : 0;
 
   // Progress summary
   std::string progressLine;
@@ -213,10 +227,10 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
                    std::to_string(totalPages) + std::string(tr(STR_PAGES_SEPARATOR));
   }
   progressLine += std::string(tr(STR_BOOK_PREFIX)) + std::to_string(bookProgressPercent) + "%";
-  renderer.drawCenteredText(UI_10_FONT_ID, 45, progressLine.c_str());
+  renderer.drawCenteredText(UI_10_FONT_ID, 45 + wrapOffset, progressLine.c_str());
 
   // Menu Items
-  const int startY = 75 + contentY;
+  const int startY = 75 + contentY + wrapOffset;
   constexpr int lineHeight = 30;
 
   for (size_t i = 0; i < menuItems.size(); ++i) {
