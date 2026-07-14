@@ -5,6 +5,106 @@
 ### Changed
 - BookFusion library browser moved from Settings to the File Transfer menu. Once your account is linked, a "Bookfusion" row appears alongside Join a Network / Connect to Calibre / Create Hotspot. The entry is hidden when no account is linked, so unlinked devices see no change.
 
+## [v1.3.0-carousel] - 2026-05-27
+
+This release tracks upstream CrossInk v1.3.0 selectively. We deliberately
+skipped the v1.3.0 cache-key migration, `RecentBooksStore::pruneMissing`,
+and the wider sleep-screen / page-as-sleep restructure — those touched
+persistent state in ways that risked the `.crosspoint/` corruption we
+already saw during the initial v1.3.0 merge attempt.
+
+What landed instead:
+
+### Added
+- **Pre-render next-page cache** — after the current page is fully drawn,
+  the next text-only page is silently rendered into the framebuffer
+  behind your back. The next forward page turn skips prewarm + page
+  render and just paints the status bar over the cached buffer, shaving
+  ~150-200 ms per page turn on text-heavy books.
+- **Quick Resume on auto-sleep** — opt-in via Settings → Display →
+  "Quick Resume on Auto-Sleep". When enabled and the device auto-sleeps
+  from inside a book, the framebuffer is saved to
+  `/.crosspoint/sleep_frame.bin` and the panel keeps your page visible
+  with a small crescent moon hint next to the percent. On wake, the
+  saved page is restored before the splash so you land directly back
+  on your last page within ~200-400 ms of pressing power. Manual
+  power-button sleeps still use the regular sleep screen.
+- **Carousel side-cover perspective cache** — the Flow carousel caches
+  each side-cover's post-perspective bitmap on first render. Subsequent
+  scrolls hit the cache for 3 of 4 sides, cutting scroll-to-scroll
+  latency by ~2-3×.
+- **Carousel pre-decoded thumbnails** — covers decode once at home
+  enter into RAM grids and render via direct framebuffer writes,
+  skipping the BMP header parse + per-row quantization on every scroll.
+- **Time-to-read projection rework** — the Flow carousel's projected
+  total reading time now uses your lifetime average completed-book time
+  during the first ~10 minutes of a new book, scaled by your pages/sec
+  on this book vs. your lifetime rate. The previous percent-based
+  formula collapsed when the user used the chapter selector to skip
+  the preface/intro, projecting a 1h total for an 8h book; the new
+  formula stays grounded.
+- **X3 battery percentage smoothing** — the BQ27220 fuel gauge's
+  documented FCC-miscalibration behavior would cause the displayed
+  percentage to snap from 25-30% to 100% during charging. We now
+  rate-limit displayed-% changes to 2% per 1.5s poll, smoothing chip
+  jumps over ~30-60 s. Same direction-lock approach upstream
+  issue #1444 suggested. X4 keeps its existing ADC + moving-average.
+
+### Changed
+- **Reader menu**: Footnotes shortcut now sits above Select Chapter
+  when the book has footnote markup — matches the common task in
+  non-fiction.
+- **Reader menu**: long book titles now wrap to 2 lines instead of
+  truncating with an ellipsis. Short titles stay single-line; layout
+  shifts only when wrapping actually fires.
+- **Tilt-to-turn shortcut** now shows a confirmation popup
+  ("Tilt Page Turn: On" / "Tilt Page Turn: Off") when toggled. Without
+  the popup the toggle is silent and the user has to physically tilt
+  to test whether the shortcut fired.
+- **Auto-sleep stats discount**: when the auto-sleep timeout ends a
+  reader session, the idle time since the last page turn is subtracted
+  from the committed reading time. Reading 5 min then leaving the
+  device idle for the 10-min auto-sleep timeout now logs ~5 min, not
+  ~15 min.
+- **Quick Resume sleep hint**: now a real crescent moon (was a solid
+  circle), placed in the status bar next to the percent text (was
+  bottom-left corner). The full reader chrome — battery bar, progress
+  bar, chapter title, percent — stays visible during sleep.
+
+### Fixed
+- **Recent Books grid / Book Stats header**: a very long author name
+  used to consume all available width, leaving the title rendered at
+  0 px (effectively invisible). We now reserve at least 1/3 of the
+  budget for the title; the author truncates with ellipsis instead.
+
+### Explicitly skipped from v1.3.0 (and why)
+- **`RecentBooksStore::pruneMissing()`** — caused `.crosspoint/recent.json`
+  corruption when `Storage.exists()` returned false transiently during
+  boot. Issue is upstream; we intentionally did not port this.
+- **Recent Books long-press menu** — bundled with pruneMissing in the
+  upstream merge. Would need surgical separation.
+- **Cache-key migration / EPUB low-memory rewrites** — high risk for
+  the maturity of our base; deferred indefinitely.
+- **Minimal sleep screen mode** — overlaps with Quick Resume.
+
+## [v1.2.11.2] - 2026-05-19
+
+### Changed
+- Flow carousel: selected-cover outline now stays on the centered cover even after the cursor moves into the bottom menu strip, so the carousel area no longer repaints on every carousel↔menu transition.
+- Flow carousel: progress bar now hugs the actual cover bottom (covers with non-3:5 aspect ratios no longer leave a dead gap above the bar). Time text follows the bar to keep the bar↔time spacing constant; title/author stays slot-anchored so the text rhythm is unchanged.
+- X4 only: bumped `topPadding` by 6 px so every header rect and the content rows below it sit a consistent distance below the lowered battery bar.
+- Reduced bar↔time spacing by 2 px to compensate for the always-on selection outline pulling the bar visually closer to the cover.
+
+### Added
+- Memory-backed `Bitmap` reads: the home carousel now slurps each thumb file into RAM once at home enter (capped at 32 KB per entry) and reads through the cached bytes on subsequent scrolls — eliminates per-scroll SD opens and shaves ~50–75 ms off cover-to-cover transitions.
+- Robust fallback chain in `UITheme::getCoverThumbPath`: exact `thumb_WxH.bmp` → legacy `thumb_H.bmp` → any other `thumb_*.bmp` in the book's cache dir → `cover.bmp` → exact path for generation. Picks up stale thumbs from earlier firmware sizes instead of falling through to the solid-black silhouette.
+- Self-healing recents state: `loadRecentCovers` and `RecentBooksGridActivity` no longer persist `coverBmpPath = ""` on a transient `generateThumbBmp` failure; the next pass re-derives the template via `RECENT_BOOKS.getDataFromBook(...)` and retries, so heap-pressure failures no longer strand books in the no-cover state forever.
+
+### Fixed
+- Flow carousel: cover↔menu transitions were re-rendering the whole carousel because `carouselDisplayIndex` encoded mode into the cache key (`recentCount + lastBookIndex` vs `selectorIndex`). Replaced with a mode-invariant `centeredBookIdx` so the cover-buffer cache survives every carousel↔menu toggle.
+- Flow carousel: side covers on X4 sat too far right and overflowed the screen edge — right-side X positions now mirror from the screen's right edge so the stack is symmetric on both the 528-px X3 and the 480-px X4.
+- Cover rendering: `drawBitmap1Bit` now supports upscaling, not just downscaling. Small thumbnails (legacy cached sizes, or books with tiny source JPEGs) used to render at 1:1 in the top-left of an oversized slot — they now fill the slot the caller asked for.
+
 ## [v1.2.11.1] - 2026-05-16
 
 ### Added

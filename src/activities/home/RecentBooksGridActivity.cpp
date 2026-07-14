@@ -41,7 +41,11 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
   bool needsGeneration = false;
   for (int i = pageStart; i < pageEnd; ++i) {
     if (recentBooks[i].coverBmpPath.empty()) continue;
-    const std::string thumbPath = UITheme::getCoverThumbPath(recentBooks[i].coverBmpPath, COVER_HEIGHT);
+    // Exact-size existence check (no fallback chain) — same rationale as
+    // HomeActivity::loadRecentCovers. We want regen to fire when the thumb
+    // at this view's COVER_HEIGHT isn't on disk, not when ANY thumb size
+    // happens to be on disk.
+    const std::string thumbPath = UITheme::resolveExactCoverThumbPath(recentBooks[i].coverBmpPath, COVER_HEIGHT);
     if (!Storage.exists(thumbPath.c_str())) {
       needsGeneration = true;
       break;
@@ -59,8 +63,22 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
 
   for (int i = pageStart; i < pageEnd; ++i) {
     RecentBook& book = recentBooks[i];
+    // Self-heal: if a prior pass cleared coverBmpPath, re-derive the template
+    // so this pass can retry generation. Mirrors the same recovery branch in
+    // HomeActivity::loadRecentCovers — the two paths must agree or one of
+    // them strands books in the no-cover state forever.
+    if (book.coverBmpPath.empty()) {
+      RecentBook refreshed = RECENT_BOOKS.getDataFromBook(book.path);
+      if (!refreshed.coverBmpPath.empty()) {
+        book.coverBmpPath = refreshed.coverBmpPath;
+        (void)RECENT_BOOKS.updateBook(book.path, book.title, book.author, book.coverBmpPath);
+      }
+    }
+    // Drive the regen decision off the exact requested size; the render
+    // path below still goes through getCoverThumbPath with its fallback
+    // chain so we don't show solid-black during regeneration.
     const std::string coverPath =
-        book.coverBmpPath.empty() ? "" : UITheme::getCoverThumbPath(book.coverBmpPath, COVER_HEIGHT);
+        book.coverBmpPath.empty() ? "" : UITheme::resolveExactCoverThumbPath(book.coverBmpPath, COVER_HEIGHT);
     if (coverPath.empty() || !Storage.exists(coverPath.c_str())) {
       if (FsHelpers::hasEpubExtension(book.path)) {
         Epub epub(book.path, "/.crosspoint");
@@ -72,8 +90,11 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           }
           GUI.fillPopupProgress(renderer, popupRect, 10 + processedCount * (90 / totalToProcess));
           if (!epub.generateThumbBmp(COVER_HEIGHT)) {
-            (void)RECENT_BOOKS.updateBook(book.path, book.title, book.author, "");
-            book.coverBmpPath = "";
+            // Keep coverBmpPath intact so the next visit retries. A single
+            // failure was previously persisted as coverBmpPath="" and left
+            // the book showing the no-cover placeholder forever.
+            LOG_ERR("RBG", "generateThumbBmp(%d) failed for %s; will retry on next visit",
+                    static_cast<int>(COVER_HEIGHT), book.path.c_str());
           }
         }
       } else if (FsHelpers::hasXtcExtension(book.path)) {
@@ -85,8 +106,8 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           }
           GUI.fillPopupProgress(renderer, popupRect, 10 + processedCount * (90 / totalToProcess));
           if (!xtc.generateThumbBmp(COVER_HEIGHT)) {
-            (void)RECENT_BOOKS.updateBook(book.path, book.title, book.author, "");
-            book.coverBmpPath = "";
+            LOG_ERR("RBG", "xtc generateThumbBmp(%d) failed for %s; will retry on next visit",
+                    static_cast<int>(COVER_HEIGHT), book.path.c_str());
           }
         }
       }
@@ -203,7 +224,13 @@ void RecentBooksGridActivity::render(RenderLock&&) {
     const int authorRawW =
         sel.author.empty() ? 0 : renderer.getTextWidth(UI_12_FONT_ID, sel.author.c_str(), EpdFontFamily::REGULAR);
     const int authorReserved = sel.author.empty() ? 0 : (gap + authorRawW);
-    const int titleMaxW = std::max(0, budget - authorReserved);
+    // Reserve at least 1/3 of the budget for the title so a very long author
+    // name can't squeeze the title down to 0 px (in which case the author
+    // would visually span the whole row and the title would vanish). Author
+    // gets truncated instead. When the author is short, the title still
+    // expands to fill whatever space the author doesn't use.
+    const int titleMinW = sel.author.empty() ? 0 : (budget / 3);
+    const int titleMaxW = std::min(budget, std::max(titleMinW, budget - authorReserved));
 
     const std::string truncTitle =
         renderer.truncatedText(UI_12_FONT_ID, sel.title.c_str(), titleMaxW, EpdFontFamily::BOLD);

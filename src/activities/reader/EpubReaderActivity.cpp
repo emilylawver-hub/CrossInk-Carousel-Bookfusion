@@ -241,6 +241,11 @@ void EpubReaderActivity::onEnter() {
   // Session count and reading time are committed on exit once thresholds are met.
   stats = BookReadingStats::load(epub->getCachePath());
   sessionStartMs = millis();
+  // Initialize lastPageTurnTime so the auto-sleep discount in onExit has a
+  // sensible baseline before the user's first page turn. Without this it
+  // would be 0 (the .h default), making (millis() - lastPageTurnTime) the
+  // entire system uptime — a huge wrong discount.
+  lastPageTurnTime = sessionStartMs;
 
   globalStats = GlobalReadingStats::load();
 
@@ -270,7 +275,21 @@ void EpubReaderActivity::onExit() {
   // Commit session stats based on how long the session lasted.
   // Sessions under 1 minute don't count toward session count or reading time.
   // Sessions under 10 seconds don't add to reading time.
-  const unsigned long elapsedMs = millis() - sessionStartMs;
+  //
+  // Auto-sleep discount: when ActivityManager::goToSleep tells us an
+  // auto-timeout sleep is imminent (autoSleepImminent_ set via
+  // onAutoSleepImminent override), we know the user wasn't actively reading
+  // for the time since the last page turn — the panel was idle long enough
+  // to trigger the timeout. Subtract that tail so it doesn't inflate stats.
+  // For non-auto-sleep exits (back button, app menu, manual sleep) we keep
+  // the original "session start → now" accounting because the user might
+  // have been reading right up to the moment they closed the book.
+  const unsigned long now = millis();
+  unsigned long elapsedMs = now - sessionStartMs;
+  if (autoSleepImminent_) {
+    const unsigned long idleTailMs = now - lastPageTurnTime;
+    elapsedMs = (idleTailMs >= elapsedMs) ? 0UL : (elapsedMs - idleTailMs);
+  }
   if (elapsedMs >= 60000UL) {
     stats.sessionCount++;
     globalStats.totalSessions++;
@@ -1076,6 +1095,17 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
                                                                                       : CrossPointSettings::TILT_OFF;
         SETTINGS.saveToFile();
         halTiltSensor.clearPendingEvents();
+        // Confirmation popup so the user can tell whether their shortcut
+        // actually fired and which state it ended up in. v1.3.0-era UX
+        // polish — without this, toggling tilt is silent and the user has
+        // to test by tilting the device, which they may not realize was
+        // necessary if they don't know they hit the shortcut.
+        const char* stateText = (SETTINGS.tiltPageTurn == CrossPointSettings::TILT_OFF) ? tr(STR_OFF) : tr(STR_ON);
+        const std::string msg = std::string(tr(STR_TILT_PAGE_TURN)) + ": " + stateText;
+        GUI.drawPopup(renderer, msg.c_str());
+        // Don't requestUpdate — drawPopup already pushed to the panel, and
+        // we want the message to persist until the user's next interaction
+        // (page turn, menu open, etc.), which will naturally re-render.
       }
       break;
     case CrossPointSettings::LONG_MENU_OFF:
@@ -1297,6 +1327,22 @@ void EpubReaderActivity::setAutoPageTurnIntervalSeconds(uint16_t seconds) {
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   pageLoadRetryCount = 0;
+  // Fast path: forward turn AND the next page is already pre-rendered into
+  // the framebuffer. Advance state inline (no RenderLock) and hand off to
+  // render() via usePreRenderedBuffer — render() will just paint the status
+  // bar over the existing buffer and flush. Saves the ~150-200 ms prewarm +
+  // page render that the slow path would otherwise do.
+  if (isForwardTurn && section && preRenderedPage.ready && preRenderedPage.spineIndex == currentSpineIndex &&
+      preRenderedPage.pageIndex == section->currentPage + 1) {
+    section->currentPage = preRenderedPage.pageIndex;
+    preRenderedPage.ready = false;
+    usePreRenderedBuffer = true;
+    stats.totalPagesTurned++;
+    globalStats.totalPagesTurned++;
+    lastPageTurnTime = millis();
+    requestUpdate();
+    return;
+  }
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
@@ -1323,6 +1369,9 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
       }
     }
   }
+  // Any navigation that didn't take the fast path discards the pre-rendered
+  // buffer: it was rendered against the previous current-page assumption.
+  preRenderedPage.ready = false;
   stats.totalPagesTurned++;
   globalStats.totalPagesTurned++;
   lastPageTurnTime = millis();
@@ -1399,6 +1448,81 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
+
+  // Capture and clear pre-render state for this render pass.
+  //   isPreRenderPass     → render the next page's content into the buffer only.
+  //   isBufferDisplayPass → buffer already holds the next page; paint status
+  //                         bar + flush + AA pass and return.
+  //   neither             → normal render; any previously pre-rendered buffer
+  //                         no longer matches the displayed page and must be
+  //                         invalidated.
+  const bool isPreRenderPass = pendingPreRender;
+  const bool isBufferDisplayPass = usePreRenderedBuffer;
+  pendingPreRender = false;
+  usePreRenderedBuffer = false;
+  if (!isPreRenderPass && !isBufferDisplayPass) {
+    preRenderedPage.ready = false;
+  }
+
+  // Buffer-display pass: framebuffer already holds the next page content from
+  // an earlier pre-render. Paint status bar over it, flush, run AA, schedule
+  // the next pre-render. Text-only pages only — image pages have their own
+  // selective-blanking double-FAST_REFRESH path in renderContents.
+  if (isBufferDisplayPass && section) {
+    auto p = section->loadPageFromSectionFile();
+    if (p && !p->hasImages()) {
+      currentPageFootnotes = std::move(p->footnotes);
+      displayPreRenderedPage(*p, orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+      silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+      if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+        pendingSyncSaveError = true;
+      }
+      queueCompletionPromptIfNeeded();
+      showPendingSyncSaveError();
+      if (!preRenderedPage.ready && section->currentPage + 1 < section->pageCount) {
+        pendingPreRender = true;
+        requestUpdate();
+      }
+      return;
+    }
+    // Page load failed or had images — fall through to a normal full render.
+  }
+
+  // Pre-render pass: load the next page on this section and render its
+  // content into the framebuffer SILENTLY (no status bar, no displayBuffer).
+  // The current page stays visible on the e-ink panel — the framebuffer's
+  // memory state changes, but no flush happens. If a later non-forward
+  // navigation occurs before the user page-turns, the normal-render branch
+  // invalidates the cache (above).
+  if (isPreRenderPass && section) {
+    if (!preRenderedPage.ready) {
+      const int nextPage = section->currentPage + 1;
+      if (nextPage < section->pageCount) {
+        const uint32_t freeHeap = ESP.getFreeHeap();
+        const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+        // Conservative gate: skip pre-render under memory pressure so we
+        // don't OOM the live reader render that follows. Mirrors the
+        // silent-next-chapter indexing gate.
+        constexpr uint32_t MIN_FREE_HEAP_FOR_PRE_RENDER = 64 * 1024;
+        constexpr uint32_t MIN_CONTIG_HEAP_FOR_PRE_RENDER = 32 * 1024;
+        if (freeHeap >= MIN_FREE_HEAP_FOR_PRE_RENDER && maxAllocHeap >= MIN_CONTIG_HEAP_FOR_PRE_RENDER) {
+          const int savedPage = section->currentPage;
+          section->currentPage = nextPage;
+          auto p = section->loadPageFromSectionFile();
+          section->currentPage = savedPage;
+          if (p && !p->hasImages()) {
+            section->currentPage = nextPage;
+            renderPageContentOnly(*p, orientedMarginTop, orientedMarginRight, orientedMarginBottom,
+                                  orientedMarginLeft);
+            section->currentPage = savedPage;
+            preRenderedPage = {true, currentSpineIndex, nextPage};
+            LOG_DBG("ERS", "Pre-rendered page %d (free=%u contig=%u)", nextPage, freeHeap, maxAllocHeap);
+          }
+        }
+      }
+    }
+    return;
+  }
 
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
@@ -1579,6 +1703,15 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   if (pendingScreenshot) {
     pendingScreenshot = false;
     ScreenshotUtil::takeScreenshot(renderer);
+  }
+
+  // Schedule a pre-render of the next page so the next forward page turn can
+  // skip prewarm + page->render and just paint the status bar over the
+  // already-populated framebuffer. The pre-render runs on the next render
+  // tick (after this one returns), with the live page still on screen.
+  if (!preRenderedPage.ready && section && section->currentPage + 1 < section->pageCount) {
+    pendingPreRender = true;
+    requestUpdate();
   }
 }
 
@@ -1798,6 +1931,56 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
             bwStoreHeapBefore, bwStoreHeapAfter, (int32_t)bwStoreHeapAfter - (int32_t)bwStoreHeapBefore,
             tBwRestore - tBwStore, tEnd - t0);
   }
+}
+
+void EpubReaderActivity::renderPageContentOnly(const Page& page, const int orientedMarginTop,
+                                               const int /*orientedMarginRight*/,
+                                               const int /*orientedMarginBottom*/, const int orientedMarginLeft) {
+  // Pre-render path: identical to the head of renderContents (prewarm scan +
+  // clearScreen + page->render) but stops short of the status bar, display
+  // flush, and grayscale AA pass. The framebuffer ends up holding the next
+  // page's BW content; the e-ink panel is untouched until displayPreRenderedPage
+  // runs on the actual page-turn.
+  auto* fcm = renderer.getFontCacheManager();
+  fcm->resetStats();
+  auto scope = fcm->createPrewarmScope();
+  page.renderText(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
+  scope.endScanAndPrewarm();
+  renderer.clearScreen();
+  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+}
+
+void EpubReaderActivity::displayPreRenderedPage(const Page& page, const int orientedMarginTop,
+                                                const int /*orientedMarginRight*/,
+                                                const int /*orientedMarginBottom*/, const int orientedMarginLeft) {
+  // Display path for a pre-rendered page. Status bar is drawn over the
+  // already-populated framebuffer, the buffer is flushed via the normal
+  // refresh cycle, and (if enabled) the grayscale AA pass re-renders the
+  // text with the same prewarm cache that's still warm from the pre-render
+  // pass. Pre-rendering is gated to text-only pages so the image-page
+  // selective-blanking path in renderContents isn't a concern here.
+  renderStatusBar();
+  ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+
+  if (!SETTINGS.textAntiAliasing) return;
+  const bool storedBwBuffer = renderer.storeBwBuffer();
+  if (!storedBwBuffer) {
+    LOG_ERR("ERS", "Skipping AA on pre-rendered page: storeBwBuffer failed");
+    return;
+  }
+  renderer.clearScreen(0x00);
+  renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  renderer.copyGrayscaleLsbBuffers();
+
+  renderer.clearScreen(0x00);
+  renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  renderer.copyGrayscaleMsbBuffers();
+
+  renderer.displayGrayBuffer();
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.restoreBwBuffer();
 }
 
 void EpubReaderActivity::renderStatusBar() const {

@@ -1253,16 +1253,26 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 
 void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
                                  const int maxHeight) const {
+  // Fit scale: a single ratio that maps source dims to the caller's max box.
+  // We fit-to-largest so the bitmap reaches whichever of maxWidth/maxHeight
+  // its aspect ratio hits first; the other dim stays ≤ max. Crucially this
+  // supports UPSCALE (scale > 1) for small bitmaps, not just downscale —
+  // previously a thumb smaller than the caller's max box rendered at 1:1
+  // in the top-left corner of an oversized slot (visible in the carousel
+  // when a book's source JPEG was tiny or a legacy thumb_*.bmp had survived
+  // a firmware bump).
   float scale = 1.0f;
   bool isScaled = false;
-  if (maxWidth > 0 && bitmap.getWidth() > maxWidth) {
-    scale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
-    isScaled = true;
+  if (maxWidth > 0 && maxHeight > 0 && bitmap.getWidth() > 0 && bitmap.getHeight() > 0) {
+    const float scaleW = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
+    const float scaleH = static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight());
+    const float fitScale = std::min(scaleW, scaleH);
+    if (fitScale < 0.999f || fitScale > 1.001f) {
+      scale = fitScale;
+      isScaled = true;
+    }
   }
-  if (maxHeight > 0 && bitmap.getHeight() > maxHeight) {
-    scale = std::min(scale, static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight()));
-    isScaled = true;
-  }
+  const bool upscaling = isScaled && scale > 1.0f;
 
   BitmapScratchLock scratchLock(*this);
   if (!scratchLock.isLocked()) return;
@@ -1284,32 +1294,45 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
 
     // Calculate screen Y based on whether BMP is top-down or bottom-up
     const int bmpYOffset = bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY;
+    // For upscale we paint a vertical BLOCK of destination rows per source row
+    // (nearest-neighbor); for downscale and 1:1 we paint a single destination
+    // row (same as the prior behavior — keeps thin horizontal lines visible
+    // across downscale because multiple source rows OR into one dest row).
+    const int dstY0 = upscaling ? y + static_cast<int>(std::floor(bmpYOffset * scale)) : -1;
+    const int dstY1 = upscaling ? y + static_cast<int>(std::floor((bmpYOffset + 1) * scale)) : -1;
     int screenY = y + (isScaled ? static_cast<int>(std::floor(bmpYOffset * scale)) : bmpYOffset);
-    if (screenY >= getScreenHeight()) {
-      continue;  // Continue reading to keep row counter in sync
-    }
-    if (screenY < 0) {
+    if (!upscaling) {
+      if (screenY >= getScreenHeight()) continue;
+      if (screenY < 0) continue;
+    } else if (dstY0 >= getScreenHeight() || dstY1 <= 0) {
       continue;
     }
 
     for (int bmpX = 0; bmpX < bitmap.getWidth(); bmpX++) {
-      int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
-      if (screenX >= getScreenWidth()) {
-        break;
-      }
-      if (screenX < 0) {
-        continue;
-      }
-
-      // Get 2-bit value (result of readNextRow quantization)
+      // Get 2-bit value (result of readNextRow quantization). val < 3 = black.
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+      if (val >= 3) continue;  // white — leave background
 
-      // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
-      // val < 3 means black pixel (draw it)
-      if (val < 3) {
+      if (upscaling) {
+        const int dstX0 = x + static_cast<int>(std::floor(bmpX * scale));
+        const int dstX1 = x + static_cast<int>(std::floor((bmpX + 1) * scale));
+        if (dstX0 >= getScreenWidth()) break;
+        if (dstX1 <= 0) continue;
+        const int yLo = std::max(dstY0, 0);
+        const int yHi = std::min(dstY1, getScreenHeight());
+        const int xLo = std::max(dstX0, 0);
+        const int xHi = std::min(dstX1, getScreenWidth());
+        for (int dy = yLo; dy < yHi; dy++) {
+          for (int dx = xLo; dx < xHi; dx++) {
+            drawPixel(dx, dy, true);
+          }
+        }
+      } else {
+        const int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
+        if (screenX >= getScreenWidth()) break;
+        if (screenX < 0) continue;
         drawPixel(screenX, screenY, true);
       }
-      // White pixels (val == 3) are not drawn (leave background)
     }
   }
 }
@@ -1369,6 +1392,251 @@ void GfxRenderer::drawPerspectiveBitmap(const Bitmap& bitmap, const int x, const
           drawPixel(screenX, screenY, false);
         }
       }
+    }
+  }
+}
+
+bool GfxRenderer::decodeBitmapTo1BitGrid(Bitmap& bitmap, DecodedThumb& out) const {
+  out = DecodedThumb{};
+  if (bitmap.getWidth() <= 0 || bitmap.getHeight() <= 0) return false;
+  // Same scratch-buffer setup as the Bitmap-based drawers: readNextRow needs
+  // both a 2-bit packed output row and a raw row buffer. Pre-decode happens
+  // off the hot path (home enter), so the lock contention here is harmless.
+  BitmapScratchLock scratchLock(*this);
+  if (!scratchLock.isLocked()) return false;
+  const int outputRowSize = (bitmap.getWidth() + 3) / 4;
+  if (!ensureBitmapScratchBuffers(outputRowSize, bitmap.getRowBytes())) return false;
+  auto* outputRow = bitmapScratchOutputRow_;
+  auto* rowBytes = bitmapScratchRowBytes_;
+
+  out.width = bitmap.getWidth();
+  out.height = bitmap.getHeight();
+  out.topDown = bitmap.isTopDown();
+  out.rowBytes = (out.width + 7) / 8;
+  out.bits.assign(static_cast<size_t>(out.rowBytes) * static_cast<size_t>(out.height), 0);
+
+  // Read source rows in their natural order, but write into the grid in
+  // top-down order — the consumer doesn't need to flip later. The y-index in
+  // the grid is the logical "from top" row.
+  for (int srcY = 0; srcY < out.height; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      out = DecodedThumb{};
+      return false;
+    }
+    const int gridY = out.topDown ? srcY : (out.height - 1 - srcY);
+    uint8_t* dstRow = out.bits.data() + static_cast<size_t>(gridY) * out.rowBytes;
+    // outputRow is 2-bit packed (4 source pixels per byte). For 1-bit content,
+    // val < 3 means black. Repack into 1 bit per pixel, MSB first (so the
+    // grid layout matches the framebuffer's bit ordering).
+    for (int px = 0; px < out.width; px++) {
+      const uint8_t val = (outputRow[px / 4] >> (6 - ((px * 2) % 8))) & 0x3;
+      if (val < 3) {
+        dstRow[px / 8] |= static_cast<uint8_t>(1u << (7 - (px % 8)));
+      }
+    }
+  }
+  // After flip-to-top-down, downstream code can treat topDown as true.
+  out.topDown = true;
+  return true;
+}
+
+namespace {
+// Test a bit in a packed MSB-first row.
+inline bool gridBit(const uint8_t* row, int x) { return (row[x / 8] >> (7 - (x % 8))) & 0x1; }
+
+// Inline pixel write used by the FromGrid blitters — same math as
+// GfxRenderer::drawPixel but without the LOG_ERR path and the per-call
+// rotateCoordinates dispatch. Caller has already clipped (screenX, screenY)
+// to the logical screen.
+inline void writeFramebufferBit(uint8_t* fb, GfxRenderer::Orientation orientation, uint16_t panelWidth,
+                                uint16_t panelHeight, uint16_t panelWidthBytes, int screenX, int screenY, bool state) {
+  int phyX = 0;
+  int phyY = 0;
+  switch (orientation) {
+    case GfxRenderer::Portrait:
+      phyX = screenY;
+      phyY = panelHeight - 1 - screenX;
+      break;
+    case GfxRenderer::LandscapeClockwise:
+      phyX = panelWidth - 1 - screenX;
+      phyY = panelHeight - 1 - screenY;
+      break;
+    case GfxRenderer::PortraitInverted:
+      phyX = panelWidth - 1 - screenY;
+      phyY = screenX;
+      break;
+    case GfxRenderer::LandscapeCounterClockwise:
+      phyX = screenX;
+      phyY = screenY;
+      break;
+  }
+  const uint32_t byteIndex = static_cast<uint32_t>(phyY) * panelWidthBytes + (phyX / 8);
+  const uint8_t bitMask = static_cast<uint8_t>(1u << (7 - (phyX % 8)));
+  if (state) {
+    fb[byteIndex] &= ~bitMask;
+  } else {
+    fb[byteIndex] |= bitMask;
+  }
+}
+}  // namespace
+
+void GfxRenderer::drawBitmap1BitFromGrid(const DecodedThumb& grid, const int x, const int y, const int maxWidth,
+                                         const int maxHeight) const {
+  if (!grid.valid()) return;
+  // Fit-to-largest scale, same semantics as drawBitmap1Bit (supports upscale).
+  float scale = 1.0f;
+  bool isScaled = false;
+  if (maxWidth > 0 && maxHeight > 0) {
+    const float scaleW = static_cast<float>(maxWidth) / static_cast<float>(grid.width);
+    const float scaleH = static_cast<float>(maxHeight) / static_cast<float>(grid.height);
+    const float fitScale = std::min(scaleW, scaleH);
+    if (fitScale < 0.999f || fitScale > 1.001f) {
+      scale = fitScale;
+      isScaled = true;
+    }
+  }
+  const bool upscaling = isScaled && scale > 1.0f;
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  uint8_t* fb = frameBuffer;
+
+  for (int srcY = 0; srcY < grid.height; srcY++) {
+    const int gridYOffset = grid.topDown ? srcY : (grid.height - 1 - srcY);
+    const uint8_t* srcRow = grid.bits.data() + static_cast<size_t>(gridYOffset) * grid.rowBytes;
+    const int dstY0 = upscaling ? y + static_cast<int>(std::floor(gridYOffset * scale)) : -1;
+    const int dstY1 = upscaling ? y + static_cast<int>(std::floor((gridYOffset + 1) * scale)) : -1;
+    int screenY = y + (isScaled ? static_cast<int>(std::floor(gridYOffset * scale)) : gridYOffset);
+    if (!upscaling) {
+      if (screenY >= screenH || screenY < 0) continue;
+    } else if (dstY0 >= screenH || dstY1 <= 0) {
+      continue;
+    }
+
+    for (int srcX = 0; srcX < grid.width; srcX++) {
+      if (!gridBit(srcRow, srcX)) continue;  // white — leave background
+
+      if (upscaling) {
+        const int dstX0 = x + static_cast<int>(std::floor(srcX * scale));
+        const int dstX1 = x + static_cast<int>(std::floor((srcX + 1) * scale));
+        if (dstX0 >= screenW) break;
+        if (dstX1 <= 0) continue;
+        const int yLo = std::max(dstY0, 0);
+        const int yHi = std::min(dstY1, screenH);
+        const int xLo = std::max(dstX0, 0);
+        const int xHi = std::min(dstX1, screenW);
+        for (int dy = yLo; dy < yHi; dy++) {
+          for (int dx = xLo; dx < xHi; dx++) {
+            writeFramebufferBit(fb, orientation, panelWidth, panelHeight, panelWidthBytes, dx, dy, true);
+          }
+        }
+      } else {
+        const int screenX = x + (isScaled ? static_cast<int>(std::floor(srcX * scale)) : srcX);
+        if (screenX >= screenW) break;
+        if (screenX < 0) continue;
+        writeFramebufferBit(fb, orientation, panelWidth, panelHeight, panelWidthBytes, screenX, screenY, true);
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawPerspectiveFromGrid(const DecodedThumb& grid, const int x, const int y, const int w, const int hL,
+                                          const int hR) const {
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
+  if (!grid.valid() || w <= 0 || hL <= 0 || hR <= 0) return;
+  const int srcW = grid.width;
+  const int srcH = grid.height;
+  const int hMax = std::max(hL, hR);
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  uint8_t* fb = frameBuffer;
+
+  // Iterate source rows directly out of the grid (no readNextRow, no
+  // ensureBitmapScratchBuffers, no scratch lock — the grid is read-only here).
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    const int gridRowIdx = grid.topDown ? srcY : (srcH - 1 - srcY);
+    const uint8_t* srcRow = grid.bits.data() + static_cast<size_t>(gridRowIdx) * grid.rowBytes;
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+      const int screenX = x + dx;
+      if (screenX < 0 || screenX >= screenW) continue;
+
+      const int srcX = (dx * srcW) / w;
+      // 1 = black (draw), 0 = white (skip). drawPerspectiveBitmap matched
+      // BW renderMode here; render-mode handling for grayscale variants is
+      // intentionally omitted — the carousel only ever draws in BW.
+      if (!gridBit(srcRow, srcX)) continue;
+
+      // gridRowIdx is already top-down (decodeBitmapTo1BitGrid normalised);
+      // map to the dst column's vertical span using nearest-neighbor.
+      const int dstYStart = (gridRowIdx * colH) / srcH;
+      const int dstYEnd = ((gridRowIdx + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int screenY = y + colTop + dy;
+        if (screenY < 0 || screenY >= screenH) continue;
+        writeFramebufferBit(fb, orientation, panelWidth, panelHeight, panelWidthBytes, screenX, screenY, true);
+      }
+    }
+  }
+}
+
+void GfxRenderer::renderPerspectiveToBuffer(const DecodedThumb& grid, const int w, const int hL, const int hR,
+                                            uint8_t* outBuf, const size_t outBufSize) const {
+  if (!grid.valid() || w <= 0 || hL <= 0 || hR <= 0 || outBuf == nullptr) return;
+  const int hMax = std::max(hL, hR);
+  const int outRowBytes = (w + 7) / 8;
+  if (outBufSize < static_cast<size_t>(outRowBytes) * static_cast<size_t>(hMax)) return;
+
+  const int srcW = grid.width;
+  const int srcH = grid.height;
+
+  // Same loop as drawPerspectiveFromGrid, but the destination is a packed
+  // buffer at (0, 0) instead of the framebuffer at (x, y). The caller is
+  // responsible for pre-zeroing the buffer; we only OR in 1-bits.
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    const int gridRowIdx = grid.topDown ? srcY : (srcH - 1 - srcY);
+    const uint8_t* srcRow = grid.bits.data() + static_cast<size_t>(gridRowIdx) * grid.rowBytes;
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+
+      const int srcX = (dx * srcW) / w;
+      if (!gridBit(srcRow, srcX)) continue;
+
+      const int dstYStart = (gridRowIdx * colH) / srcH;
+      const int dstYEnd = ((gridRowIdx + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int bufY = colTop + dy;
+        if (bufY < 0 || bufY >= hMax) continue;
+        outBuf[bufY * outRowBytes + (dx / 8)] |= static_cast<uint8_t>(1u << (7 - (dx % 8)));
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawPackedBitmap(const uint8_t* buf, const int bufW, const int bufH, const int x,
+                                   const int y) const {
+  if (buf == nullptr || bufW <= 0 || bufH <= 0) return;
+  const int rowBytes = (bufW + 7) / 8;
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  uint8_t* fb = frameBuffer;
+
+  for (int by = 0; by < bufH; by++) {
+    const int screenY = y + by;
+    if (screenY < 0) continue;
+    if (screenY >= screenH) break;
+    const uint8_t* srcRow = buf + by * rowBytes;
+    for (int bx = 0; bx < bufW; bx++) {
+      if (!gridBit(srcRow, bx)) continue;
+      const int screenX = x + bx;
+      if (screenX < 0) continue;
+      if (screenX >= screenW) break;
+      writeFramebufferBit(fb, orientation, panelWidth, panelHeight, panelWidthBytes, screenX, screenY, true);
     }
   }
 }

@@ -218,9 +218,15 @@ void ActivityManager::goToReader(std::string path, const bool suppressBackReleas
   replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path), suppressBackRelease));
 }
 
-void ActivityManager::goToSleep() {
+void ActivityManager::goToSleep(bool fromTimeout) {
   const bool canSnapshotOverlay = currentActivity && currentActivity->canSnapshotForSleepOverlay();
-  replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, canSnapshotOverlay));
+  // Signal the current activity that an auto-sleep is imminent BEFORE we
+  // queue the replacement. Used by the reader to drop the idle tail from
+  // its session stats so a 10-minute timeout doesn't get logged as reading.
+  if (fromTimeout && currentActivity) {
+    currentActivity->onAutoSleepImminent();
+  }
+  replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, canSnapshotOverlay, fromTimeout));
   loop();  // Important: sleep screen must be rendered immediately, the caller will go to sleep right after this returns
 }
 

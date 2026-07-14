@@ -31,6 +31,11 @@ class EpubReaderActivity final : public Activity {
   BookReadingStats stats;
   GlobalReadingStats globalStats;
   unsigned long sessionStartMs = 0UL;
+  // Set by onAutoSleepImminent (called from ActivityManager::goToSleep when
+  // an auto-timeout sleep is about to replace this activity). onExit checks
+  // this and discounts the time since the last page turn from the session
+  // stats — that idle tail is wall-clock time, not reading time.
+  bool autoSleepImminent_ = false;
   // Signals that the next render should reposition within the newly loaded section
   // based on a cross-book percentage jump.
   bool pendingPercentJump = false;
@@ -84,6 +89,34 @@ class EpubReaderActivity final : public Activity {
 
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
+  // Pre-rendered next-page buffer (ported from buffer-crosspoint-reader 1.44).
+  // After the current page is fully drawn and displayed, the next text-only
+  // page is silently rendered into the frame buffer behind the user's back —
+  // the next forward page turn then skips the prewarm+page->render pass and
+  // just superimposes the status bar + flushes to the display, saving ~200 ms
+  // per page turn. The framebuffer's last actually-displayed contents stay on
+  // the e-ink panel unchanged, since e-ink retains the previous image and
+  // we never call displayBuffer() during the pre-render pass.
+  struct PreRenderedPage {
+    bool ready = false;
+    int spineIndex = -1;
+    int pageIndex = -1;
+  };
+  PreRenderedPage preRenderedPage;
+  // Set by the tail of render() to request a pre-render pass on the next tick.
+  bool pendingPreRender = false;
+  // Set by pageTurn() when the buffered next page matches the requested page;
+  // tells render() the framebuffer already holds content and only status bar
+  // + display flush are needed.
+  bool usePreRenderedBuffer = false;
+  // Render page content (prewarm + clear + page->render) WITHOUT touching the
+  // status bar or pushing displayBuffer. Used by the pre-render pass.
+  void renderPageContentOnly(const Page& page, int orientedMarginTop, int orientedMarginRight,
+                             int orientedMarginBottom, int orientedMarginLeft);
+  // Superimpose status bar over the already-populated framebuffer, flush via
+  // the refresh cycle, then run the grayscale AA pass for text-only pages.
+  void displayPreRenderedPage(const Page& page, int orientedMarginTop, int orientedMarginRight,
+                              int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
@@ -121,6 +154,7 @@ class EpubReaderActivity final : public Activity {
   void render(RenderLock&& lock) override;
   bool preventAutoSleep() override { return automaticPageTurnActive; }
   bool isReaderActivity() const override { return true; }
+  void onAutoSleepImminent() override { autoSleepImminent_ = true; }
   bool canSnapshotForSleepOverlay() const override { return true; }
   void setAutoPageTurnIntervalSeconds(uint16_t seconds);
   uint16_t getAutoPageTurnIntervalSeconds() const;
