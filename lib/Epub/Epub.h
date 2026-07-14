@@ -69,6 +69,10 @@ class Epub {
   // thumbnail height.
   // Returns false on missing cache/cover, unsupported image format, or conversion failure.
   bool generateThumbBmp(int width, int height) const;
+  // Like generateThumbBmp but does a lightweight OPF-only parse when the full
+  // metadata cache hasn't been built yet. Skips buildBookBin, so it's safe to
+  // call for books that have never been opened.
+  bool generateThumbBmpFast(int width, int height);
   uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize) const;

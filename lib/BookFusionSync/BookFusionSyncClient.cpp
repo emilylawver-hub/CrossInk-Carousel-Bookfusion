@@ -17,6 +17,29 @@ void addAuthHeaders(HTTPClient& http) {
   http.addHeader("Authorization", bearer.c_str());
   http.addHeader("Accept", BookFusionSyncClient::API_ACCEPT);
 }
+
+// WiFiClientSecure::read() returns -1 between TLS records even when the
+// connection is still alive and more data is coming. ArduinoJson's Stream
+// reader treats -1 as a null byte, which corrupts mid-stream JSON parsing.
+// This wrapper blocks in read() until a byte is actually available, so
+// ArduinoJson only sees -1 at true EOF (connection closed + buffer drained).
+class BlockingStream : public Stream {
+ public:
+  explicit BlockingStream(WiFiClientSecure& c) : _client(c) {}
+  int available() override { return _client.available(); }
+  int read() override {
+    while (_client.connected() || _client.available() > 0) {
+      if (_client.available() > 0) return _client.read();
+      delay(1);
+    }
+    return -1;
+  }
+  int peek() override { return _client.peek(); }
+  size_t write(uint8_t) override { return 0; }
+
+ private:
+  WiFiClientSecure& _client;
+};
 }  // namespace
 
 // --- Device Code Auth ---
@@ -265,12 +288,9 @@ BookFusionSyncClient::Error BookFusionSyncClient::searchBooks(int page, BookFusi
   filter[0]["format"] = true;
   filter[0]["authors"][0]["name"] = true;
 
-  // Stream-parse directly from the TLS client (WiFiClientSecure implements
-  // Client, so ArduinoJson uses connected() to detect end-of-body rather than
-  // relying on available(), which returns 0 between TLS records and previously
-  // caused IncompleteInput on raw Stream parsing).
+  BlockingStream blockingStream(secureClient);
   JsonDocument doc;
-  const auto parseErr = deserializeJson(doc, secureClient, DeserializationOption::Filter(filter));
+  const auto parseErr = deserializeJson(doc, blockingStream, DeserializationOption::Filter(filter));
   http.end();
 
   if (parseErr != DeserializationError::Ok) {
@@ -358,12 +378,12 @@ BookFusionSyncClient::Error BookFusionSyncClient::getDownloadUrl(uint32_t bookId
     return SERVER_ERROR;
   }
 
-  // Filter to keep only the url field — avoids a second heap copy of the long URL.
   JsonDocument filter;
   filter["url"] = true;
 
+  BlockingStream blockingStream(secureClient);
   JsonDocument doc;
-  const auto parseErr = deserializeJson(doc, secureClient, DeserializationOption::Filter(filter));
+  const auto parseErr = deserializeJson(doc, blockingStream, DeserializationOption::Filter(filter));
   http.end();
 
   if (parseErr != DeserializationError::Ok) {

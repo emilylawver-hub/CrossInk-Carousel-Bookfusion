@@ -818,6 +818,41 @@ bool Epub::generateThumbBmp(int width, int height) const {
   return false;
 }
 
+bool Epub::generateThumbBmpFast(int width, int height) {
+  // Fast path: cache already loaded, delegate to const method
+  if (bookMetadataCache && bookMetadataCache->isLoaded()) {
+    return generateThumbBmp(width, height);
+  }
+
+  if (height <= 0) height = kDefaultThumbHeight;
+  if (width <= 0) width = static_cast<int>((static_cast<int64_t>(height) * 3 + 2) / 5);
+
+  // Thumb may already exist from a previous run even without a loaded cache
+  const std::string thumbPath = getThumbBmpPathForDimensions(cachePath, width, height);
+  if (nonEmptyFileExists(thumbPath)) return true;
+
+  // Slow path: parse only the OPF (no TOC, no buildBookBin) to get coverItemHref.
+  // ContentOpfParser skips all spine writing when cache == nullptr (guarded by
+  // `if (self->cache)`), so this is lightweight even for large EPUBs.
+  setupCacheDir();
+
+  const bool hadCache = static_cast<bool>(bookMetadataCache);
+  if (!hadCache) bookMetadataCache = std::make_unique<BookMetadataCache>(cachePath);
+
+  BookMetadataCache::BookMetadata quickMeta;
+  if (!parseContentOpf(quickMeta) || quickMeta.coverItemHref.empty()) {
+    if (!hadCache) bookMetadataCache.reset();
+    return false;
+  }
+
+  bookMetadataCache->setLoadedWithCoverHref(quickMeta.coverItemHref);
+  const bool result = generateThumbBmp(width, height);
+
+  // Don't leave a partial cache that would make load() think the book is indexed
+  if (!hadCache) bookMetadataCache.reset();
+  return result;
+}
+
 uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
